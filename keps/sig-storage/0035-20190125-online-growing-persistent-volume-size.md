@@ -102,41 +102,36 @@ To mark a volume as file system resizing required, we add a `fsResizeRequired` f
 func (asw *actualStateOfWorld) MarkFSResizeRequired(
 	volumeName v1.UniqueVolumeName,
 	podName volumetypes.UniquePodName) {
-	if !utilfeature.DefaultFeatureGate.Enabled(features.ExpandOnlinePersistentVolumes) {
-		// Do not perform online resizing if feature gate is disabled.
-		return
-	}
 	asw.Lock()
 	defer asw.Unlock()
 	volumeObj, exist := asw.attachedVolumes[volumeName]
 	if !exist {
-		glog.Warningf("MarkFSResizeRequired for volume %s failed as volume not exist", volumeName)
+		klog.Warningf("MarkFSResizeRequired for volume %s failed as volume not exist", volumeName)
 		return
 	}
 
 	podObj, exist := volumeObj.mountedPods[podName]
 	if !exist {
-		glog.Warningf("MarkFSResizeRequired for volume %s failed "+
+		klog.Warningf("MarkFSResizeRequired for volume %s failed "+
 			"as pod(%s) not exist", volumeName, podName)
 		return
 	}
 
 	volumePlugin, err :=
-		asw.volumePluginMgr.FindExpandablePluginBySpec(volumeObj.spec)
+		asw.volumePluginMgr.FindExpandablePluginBySpec(podObj.volumeSpec)
 	if err != nil || volumePlugin == nil {
 		// Log and continue processing
-		glog.Errorf(
-			"MarkFSResizeRequired failed to FindPluginBySpec for pod %q (podUid %q) volume: %q (volSpecName: %q)",
+		klog.Errorf(
+			"MarkFSResizeRequired failed to find expandable plugin for pod %q volume: %q (volSpecName: %q)",
 			podObj.podName,
-			podObj.podUID,
 			volumeObj.volumeName,
-			volumeObj.spec.Name())
+			podObj.volumeSpec.Name())
 		return
 	}
 
 	if volumePlugin.RequiresFSResize() {
 		if !podObj.fsResizeRequired {
-			glog.V(3).Infof("PVC volume %s(OuterVolumeSpecName %s) of pod %s requires file system resize",
+			klog.V(3).Infof("PVC volume %s(OuterVolumeSpecName %s) of pod %s requires file system resize",
 				volumeName, podObj.outerVolumeSpecName, podName)
 			podObj.fsResizeRequired = true
 		}
@@ -148,6 +143,8 @@ func (asw *actualStateOfWorld) MarkFSResizeRequired(
 And `DesiredStateOfWorldPopulator` uses a `checkVolumeFSResize` method to perform the operation described as above, which invokes inside `processPodVolumes` method:
 
 ```go
+
+
 // checkVolumeFSResize checks whether a PVC mounted by the pod requires file
 // system resize or not. If so, marks this volume as fsResizeRequired in ASW.
 // - mountedVolumesForPod stores all mounted volumes in ASW, because online
@@ -167,7 +164,7 @@ func (dswp *desiredStateOfWorldPopulator) checkVolumeFSResize(
 		// Only PVC supports resize operation.
 		return
 	}
-	uniqueVolumeName, exist := getUniqueVolumeNameFromASW(uniquePodName, podVolume.Name, mountedVolumesForPod)
+	uniqueVolumeName, exist := getUniqueVolumeName(uniquePodName, podVolume.Name, mountedVolumesForPod)
 	if !exist {
 		// Volume not exist in ASW, we assume it hasn't been mounted yet. If it needs resize,
 		// it will be handled as offline resize(if it indeed hasn't been mounted yet),
@@ -176,12 +173,12 @@ func (dswp *desiredStateOfWorldPopulator) checkVolumeFSResize(
 	}
 	fsVolume, err := util.CheckVolumeModeFilesystem(volumeSpec)
 	if err != nil {
-		glog.Errorf("Check volume mode failed for volume %s(OuterVolumeSpecName %s): %v",
+		klog.Errorf("Check volume mode failed for volume %s(OuterVolumeSpecName %s): %v",
 			uniqueVolumeName, podVolume.Name, err)
 		return
 	}
 	if !fsVolume {
-		glog.V(5).Infof("Block mode volume needn't to check file system resize request")
+		klog.V(5).Infof("Block mode volume needn't to check file system resize request")
 		return
 	}
 	if processedVolumesForFSResize.Has(string(uniqueVolumeName)) {
@@ -191,7 +188,7 @@ func (dswp *desiredStateOfWorldPopulator) checkVolumeFSResize(
 	}
 	if mountedReadOnlyByPod(podVolume, pod) {
 		// This volume is used as read only by this pod, we don't perform resize for read only volumes.
-		glog.V(5).Infof("Skip file system resize check for volume %s in pod %s/%s "+
+		klog.V(5).Infof("Skip file system resize check for volume %s in pod %s/%s "+
 			"as the volume is mounted as readonly", podVolume.Name, pod.Namespace, pod.Name)
 		return
 	}
@@ -221,6 +218,23 @@ Currently `Reconciler` runs a periodic loop to reconcile the desired state of th
 In each loop, for each volume in DSW, `Reconciler` checks whether it exists in ASW or not. If the volume exists and is marked as file system resizing required, ASW returns a `fsResizeRequiredError` error. Then `Reconciler` triggers a file system resizing operation for this volume. The code snippet looks like this:
 
 ```go
+} else if cache.IsFSResizeRequiredError(err) &&
+			utilfeature.DefaultFeatureGate.Enabled(features.ExpandInUsePersistentVolumes) {
+			klog.V(4).Infof(volumeToMount.GenerateMsgDetailed("Starting operationExecutor.ExpandVolumeFSWithoutUnmounting", ""))
+			err := rc.operationExecutor.ExpandVolumeFSWithoutUnmounting(
+				volumeToMount.VolumeToMount,
+				rc.actualStateOfWorld)
+			if err != nil &&
+				!nestedpendingoperations.IsAlreadyExists(err) &&
+				!exponentialbackoff.IsExponentialBackoff(err) {
+				// Ignore nestedpendingoperations.IsAlreadyExists and exponentialbackoff.IsExponentialBackoff errors, they are expected.
+				// Log all other errors.
+				klog.Errorf(volumeToMount.GenerateErrorDetailed("operationExecutor.ExpandVolumeFSWithoutUnmounting failed", err).Error())
+			}
+			if err == nil {
+				klog.V(4).Infof(volumeToMount.GenerateMsgDetailed("operationExecutor.ExpandVolumeFSWithoutUnmounting started", ""))
+			}
+}
 if cache.IsFSResizeRequiredError(err) {
 	glog.V(4).Infof(volumeToMount.GenerateMsgDetailed("Starting operationExecutor.VolumeFileSystemResize", ""))
 	err := rc.operationExecutor.VolumeFileSystemResize(
@@ -245,17 +259,19 @@ We also add a `MarkVolumeAsResized` to `ActualStateOfWorldMounterUpdater`, which
 
 The main work of `GenerateVolumeFSResizeFunc` is simply invoking the `resizeFileSystem` method and `MarkVolumeAsResized`, it looks like this:
 
+
 ```go
-	resizeSimpleError, resizeDetailedError := og.resizeFileSystem(volumeToMount, volumeToMount.DevicePath, deviceMountPath, volumePlugin.GetPluginName())
-	if resizeSimpleError != nil || resizeDetailedError != nil {
-		return resizeSimpleError, resizeDetailedError
-	}
-	markFSResizedErr := actualStateOfWorld.MarkVolumeAsResized(volumeToMount.PodName, volumeToMount.VolumeName)
-	if markFSResizedErr != nil {
-		// On failure, return error. Caller will log and retry.
-		return volumeToMount.GenerateError("VolumeFSResize.MarkVolumeAsResized failed", markFSResizedErr)
-	}
-	return nil, nil
+		resizeSimpleError, resizeDetailedError := og.resizeFileSystem(volumeToMount, volumeToMount.DevicePath, deviceMountPath, volumePlugin.GetPluginName())
+
+		if resizeSimpleError != nil || resizeDetailedError != nil {
+			return resizeSimpleError, resizeDetailedError
+		}
+		markFSResizedErr := actualStateOfWorld.MarkVolumeAsResized(volumeToMount.PodName, volumeToMount.VolumeName)
+		if markFSResizedErr != nil {
+			// On failure, return error. Caller will log and retry.
+			return volumeToMount.GenerateError("VolumeFSResize.MarkVolumeAsResized failed", markFSResizedErr)
+		}
+    return nil, nil
 ```
 
 - If the file system resizing operation succeeds, `resizeFileSystem` will change `PVC.Status.Capacity` to the desired volume size in `PV.Spec.Capacity`, and remove the `PersistentVolumeClaimFileSystemResizePending` condition from `PVC.Status.Conditions`, then this resizing request is marked as finished.
